@@ -19,7 +19,7 @@ class BIMPM(nn.Module):
         self.word_emb.weight.data.copy_(data.TEXT.vocab.vectors)
         # no fine-tuning for word vectors
         self.word_emb.weight.requires_grad = False
-
+        self.trainingtype = args.training
         self.char_LSTM = nn.LSTM(
             input_size=self.args.char_dim,
             hidden_size=self.args.char_hidden_size,
@@ -38,12 +38,12 @@ class BIMPM(nn.Module):
 
         # ----- Matching Layer -----
         for i in range(1, 9):
-            setattr(self, f'mp_w{i}',
+            setattr(self, 'mp_w'+str(i),
                     nn.Parameter(torch.rand(self.l, self.args.hidden_size)))
 
         # ----- Aggregation Layer -----
         self.aggregation_LSTM = nn.LSTM(
-            input_size=self.l * 8,
+            input_size=self.l*2 if self.trainingtype else self.l * 8,
             hidden_size=self.args.hidden_size,
             num_layers=1,
             bidirectional=True,
@@ -83,7 +83,7 @@ class BIMPM(nn.Module):
 
         # ----- Matching Layer -----
         for i in range(1, 9):
-            w = getattr(self, f'mp_w{i}')
+            w = getattr(self, 'mp_w'+str(i))
             nn.init.kaiming_normal(w)
 
         # ----- Aggregation Layer -----
@@ -249,6 +249,7 @@ class BIMPM(nn.Module):
 
         # ----- Context Representation Layer -----
         # (batch, seq_len, hidden_size * 2)
+        #self.context_LSTM.flatten_parameters()
         con_p, _ = self.context_LSTM(p)
         con_h, _ = self.context_LSTM(h)
 
@@ -263,82 +264,120 @@ class BIMPM(nn.Module):
 
         # (batch, seq_len, hidden_size), (batch, hidden_size)
         # -> (batch, seq_len, l)
-        mv_p_full_fw = mp_matching_func(con_p_fw, con_h_fw[:, -1, :], self.mp_w1)
-        mv_p_full_bw = mp_matching_func(con_p_bw, con_h_bw[:, 0, :], self.mp_w2)
-        mv_h_full_fw = mp_matching_func(con_h_fw, con_p_fw[:, -1, :], self.mp_w1)
-        mv_h_full_bw = mp_matching_func(con_h_bw, con_p_bw[:, 0, :], self.mp_w2)
+        if self.trainingtype == 0 or self.trainingtype == 1:
+            mv_p_full_fw = mp_matching_func(con_p_fw, con_h_fw[:, -1, :], self.mp_w1)
+            mv_p_full_bw = mp_matching_func(con_p_bw, con_h_bw[:, 0, :], self.mp_w2)
+            mv_h_full_fw = mp_matching_func(con_h_fw, con_p_fw[:, -1, :], self.mp_w1)
+            mv_h_full_bw = mp_matching_func(con_h_bw, con_p_bw[:, 0, :], self.mp_w2)
+        if self.trainingtype == 1:
+            mv_p = torch.cat(
+                [mv_p_full_fw,
+                 mv_p_full_bw], dim=2)
+            mv_h = torch.cat(
+                [mv_h_full_fw,
+                 mv_h_full_bw], dim=2)
+
 
         # 2. Maxpooling-Matching
+        if self.trainingtype == 0 or self.trainingtype == 2:
 
-        # (batch, seq_len1, seq_len2, l)
-        mv_max_fw = mp_matching_func_pairwise(con_p_fw, con_h_fw, self.mp_w3)
-        mv_max_bw = mp_matching_func_pairwise(con_p_bw, con_h_bw, self.mp_w4)
+            # (batch, seq_len1, seq_len2, l)
+            mv_max_fw = mp_matching_func_pairwise(con_p_fw, con_h_fw, self.mp_w3)
+            mv_max_bw = mp_matching_func_pairwise(con_p_bw, con_h_bw, self.mp_w4)
 
-        # (batch, seq_len, l)
-        mv_p_max_fw, _ = mv_max_fw.max(dim=2)
-        mv_p_max_bw, _ = mv_max_bw.max(dim=2)
-        mv_h_max_fw, _ = mv_max_fw.max(dim=1)
-        mv_h_max_bw, _ = mv_max_bw.max(dim=1)
+            # (batch, seq_len, l)
+            mv_p_max_fw, _ = mv_max_fw.max(dim=2)
+            mv_p_max_bw, _ = mv_max_bw.max(dim=2)
+            mv_h_max_fw, _ = mv_max_fw.max(dim=1)
+            mv_h_max_bw, _ = mv_max_bw.max(dim=1)
+        if self.trainingtype == 2:
+            mv_p = torch.cat(
+                [mv_p_max_fw,
+                 mv_p_max_bw], dim=2)
+            mv_h = torch.cat(
+                [mv_h_max_fw,
+                 mv_h_max_bw], dim=2)
+
 
         # 3. Attentive-Matching
+        if self.trainingtype == 0 or self.trainingtype == 3 or self.trainingtype == 4:
 
-        # (batch, seq_len1, seq_len2)
-        att_fw = attention(con_p_fw, con_h_fw)
-        att_bw = attention(con_p_bw, con_h_bw)
+            # (batch, seq_len1, seq_len2)
+            att_fw = attention(con_p_fw, con_h_fw)
+            att_bw = attention(con_p_bw, con_h_bw)
 
-        # (batch, seq_len2, hidden_size) -> (batch, 1, seq_len2, hidden_size)
-        # (batch, seq_len1, seq_len2) -> (batch, seq_len1, seq_len2, 1)
-        # -> (batch, seq_len1, seq_len2, hidden_size)
-        att_h_fw = con_h_fw.unsqueeze(1) * att_fw.unsqueeze(3)
-        att_h_bw = con_h_bw.unsqueeze(1) * att_bw.unsqueeze(3)
-        # (batch, seq_len1, hidden_size) -> (batch, seq_len1, 1, hidden_size)
-        # (batch, seq_len1, seq_len2) -> (batch, seq_len1, seq_len2, 1)
-        # -> (batch, seq_len1, seq_len2, hidden_size)
-        att_p_fw = con_p_fw.unsqueeze(2) * att_fw.unsqueeze(3)
-        att_p_bw = con_p_bw.unsqueeze(2) * att_bw.unsqueeze(3)
+            # (batch, seq_len2, hidden_size) -> (batch, 1, seq_len2, hidden_size)
+            # (batch, seq_len1, seq_len2) -> (batch, seq_len1, seq_len2, 1)
+            # -> (batch, seq_len1, seq_len2, hidden_size)
+            att_h_fw = con_h_fw.unsqueeze(1) * att_fw.unsqueeze(3)
+            att_h_bw = con_h_bw.unsqueeze(1) * att_bw.unsqueeze(3)
+            # (batch, seq_len1, hidden_size) -> (batch, seq_len1, 1, hidden_size)
+            # (batch, seq_len1, seq_len2) -> (batch, seq_len1, seq_len2, 1)
+            # -> (batch, seq_len1, seq_len2, hidden_size)
+            att_p_fw = con_p_fw.unsqueeze(2) * att_fw.unsqueeze(3)
+            att_p_bw = con_p_bw.unsqueeze(2) * att_bw.unsqueeze(3)
 
-        # (batch, seq_len1, hidden_size) / (batch, seq_len1, 1) -> (batch, seq_len1, hidden_size)
-        att_mean_h_fw = div_with_small_value(att_h_fw.sum(dim=2), att_fw.sum(dim=2, keepdim=True))
-        att_mean_h_bw = div_with_small_value(att_h_bw.sum(dim=2), att_bw.sum(dim=2, keepdim=True))
+            # (batch, seq_len1, hidden_size) / (batch, seq_len1, 1) -> (batch, seq_len1, hidden_size)
+            att_mean_h_fw = div_with_small_value(att_h_fw.sum(dim=2), att_fw.sum(dim=2, keepdim=True))
+            att_mean_h_bw = div_with_small_value(att_h_bw.sum(dim=2), att_bw.sum(dim=2, keepdim=True))
 
-        # (batch, seq_len2, hidden_size) / (batch, seq_len2, 1) -> (batch, seq_len2, hidden_size)
-        att_mean_p_fw = div_with_small_value(att_p_fw.sum(dim=1), att_fw.sum(dim=1, keepdim=True).permute(0, 2, 1))
-        att_mean_p_bw = div_with_small_value(att_p_bw.sum(dim=1), att_bw.sum(dim=1, keepdim=True).permute(0, 2, 1))
+            # (batch, seq_len2, hidden_size) / (batch, seq_len2, 1) -> (batch, seq_len2, hidden_size)
+            att_mean_p_fw = div_with_small_value(att_p_fw.sum(dim=1), att_fw.sum(dim=1, keepdim=True).permute(0, 2, 1))
+            att_mean_p_bw = div_with_small_value(att_p_bw.sum(dim=1), att_bw.sum(dim=1, keepdim=True).permute(0, 2, 1))
 
-        # (batch, seq_len, l)
-        mv_p_att_mean_fw = mp_matching_func(con_p_fw, att_mean_h_fw, self.mp_w5)
-        mv_p_att_mean_bw = mp_matching_func(con_p_bw, att_mean_h_bw, self.mp_w6)
-        mv_h_att_mean_fw = mp_matching_func(con_h_fw, att_mean_p_fw, self.mp_w5)
-        mv_h_att_mean_bw = mp_matching_func(con_h_bw, att_mean_p_bw, self.mp_w6)
+            # (batch, seq_len, l)
+            mv_p_att_mean_fw = mp_matching_func(con_p_fw, att_mean_h_fw, self.mp_w5)
+            mv_p_att_mean_bw = mp_matching_func(con_p_bw, att_mean_h_bw, self.mp_w6)
+            mv_h_att_mean_fw = mp_matching_func(con_h_fw, att_mean_p_fw, self.mp_w5)
+            mv_h_att_mean_bw = mp_matching_func(con_h_bw, att_mean_p_bw, self.mp_w6)
+        if self.trainingtype == 3:
+            mv_p = torch.cat(
+                [mv_p_att_mean_fw,
+                 mv_p_att_mean_bw], dim=2)
+            mv_h = torch.cat(
+                [mv_h_att_mean_fw,
+                 mv_h_att_mean_bw], dim=2)
+
 
         # 4. Max-Attentive-Matching
+        if self.trainingtype == 0 or self.trainingtype == 4:
 
-        # (batch, seq_len1, hidden_size)
-        att_max_h_fw, _ = att_h_fw.max(dim=2)
-        att_max_h_bw, _ = att_h_bw.max(dim=2)
-        # (batch, seq_len2, hidden_size)
-        att_max_p_fw, _ = att_p_fw.max(dim=1)
-        att_max_p_bw, _ = att_p_bw.max(dim=1)
+            # (batch, seq_len1, hidden_size)
+            att_max_h_fw, _ = att_h_fw.max(dim=2)
+            att_max_h_bw, _ = att_h_bw.max(dim=2)
+            # (batch, seq_len2, hidden_size)
+            att_max_p_fw, _ = att_p_fw.max(dim=1)
+            att_max_p_bw, _ = att_p_bw.max(dim=1)
 
-        # (batch, seq_len, l)
-        mv_p_att_max_fw = mp_matching_func(con_p_fw, att_max_h_fw, self.mp_w7)
-        mv_p_att_max_bw = mp_matching_func(con_p_bw, att_max_h_bw, self.mp_w8)
-        mv_h_att_max_fw = mp_matching_func(con_h_fw, att_max_p_fw, self.mp_w7)
-        mv_h_att_max_bw = mp_matching_func(con_h_bw, att_max_p_bw, self.mp_w8)
+            # (batch, seq_len, l)
+            mv_p_att_max_fw = mp_matching_func(con_p_fw, att_max_h_fw, self.mp_w7)
+            mv_p_att_max_bw = mp_matching_func(con_p_bw, att_max_h_bw, self.mp_w8)
+            mv_h_att_max_fw = mp_matching_func(con_h_fw, att_max_p_fw, self.mp_w7)
+            mv_h_att_max_bw = mp_matching_func(con_h_bw, att_max_p_bw, self.mp_w8)
+        if self.trainingtype == 4:
+            mv_p = torch.cat(
+                [mv_p_att_max_fw,
+                 mv_p_att_max_bw], dim=2)
+            mv_h = torch.cat(
+                [mv_h_att_max_fw,
+                 mv_h_att_max_bw], dim=2)
+
 
         # (batch, seq_len, l * 8)
-        mv_p = torch.cat(
-            [mv_p_full_fw, mv_p_max_fw, mv_p_att_mean_fw, mv_p_att_max_fw,
-             mv_p_full_bw, mv_p_max_bw, mv_p_att_mean_bw, mv_p_att_max_bw], dim=2)
-        mv_h = torch.cat(
-            [mv_h_full_fw, mv_h_max_fw, mv_h_att_mean_fw, mv_h_att_max_fw,
-             mv_h_full_bw, mv_h_max_bw, mv_h_att_mean_bw, mv_h_att_max_bw], dim=2)
+        if self.trainingtype == 0:
+            mv_p = torch.cat(
+                [mv_p_full_fw, mv_p_max_fw, mv_p_att_mean_fw, mv_p_att_max_fw,
+                 mv_p_full_bw, mv_p_max_bw, mv_p_att_mean_bw, mv_p_att_max_bw], dim=2)
+            mv_h = torch.cat(
+                [mv_h_full_fw, mv_h_max_fw, mv_h_att_mean_fw, mv_h_att_max_fw,
+                 mv_h_full_bw, mv_h_max_bw, mv_h_att_mean_bw, mv_h_att_max_bw], dim=2)
 
         mv_p = self.dropout(mv_p)
         mv_h = self.dropout(mv_h)
 
         # ----- Aggregation Layer -----
         # (batch, seq_len, l * 8) -> (2, batch, hidden_size)
+        #self.aggregation_LSTM.flatten_parameters()
         _, (agg_p_last, _) = self.aggregation_LSTM(mv_p)
         _, (agg_h_last, _) = self.aggregation_LSTM(mv_h)
 
@@ -352,5 +391,4 @@ class BIMPM(nn.Module):
         x = F.tanh(self.pred_fc1(x))
         x = self.dropout(x)
         x = self.pred_fc2(x)
-
         return x

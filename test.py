@@ -40,7 +40,8 @@ def test(model, args, data, mode='test'):
 
         pred = model(**kwargs)
 
-        batch_loss = criterion(pred, batch.label)
+        batch_loss = criterion(pred.view(-1,2), batch.label)
+        print(batch_loss.shape)
         loss += batch_loss.data[0]
 
         _, pred = pred.max(dim=1)
@@ -98,4 +99,4 @@ if __name__ == '__main__':
 
     _, acc = test(model, args, data)
 
-    print(f'test acc: {acc:.3f}')
+    print('test acc:' + acc)
